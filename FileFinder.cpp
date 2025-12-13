@@ -1,7 +1,4 @@
-﻿// file_search_mt.cpp
-// Компиляция: MSVC: cl /std:c++17 file_search_mt.cpp
-//            g++: g++ -std=c++17 file_search_mt.cpp -o file_search_mt
-// Операционная система: Windows 10 (код использует std::filesystem)
+﻿// запуск программы FileFinder.exe <путь_к_каталогу> <шаблон_поиска> [количество_потоков]
 
 #include <iostream>
 #include <filesystem>
@@ -16,11 +13,10 @@
 #include <locale.h> 
 
 namespace fs = std::filesystem;
-// Преобразует шаблон с '*' и '?' в регулярное выражение
-std::regex wildcardToRegex(const std::string& pattern) {
+std::regex wildcardToRegex(const std::string& pattern) { // преобразование шаблона в регулярное выражение
     std::string regex_s;
-    regex_s.reserve(pattern.size() * 2);
-    regex_s.push_back('^');
+    regex_s.reserve(pattern.size() * 2); // резервация памяти заранее
+    regex_s.push_back('^'); // ^ - начало строки
     for (char c : pattern) {
         switch (c) {
         case '*': regex_s += ".*"; break;
@@ -34,25 +30,23 @@ std::regex wildcardToRegex(const std::string& pattern) {
             regex_s.push_back(c);
         }
     }
-    regex_s.push_back('$');
+    regex_s.push_back('$'); // $ - конец строки
     return std::regex(regex_s, std::regex::icase);
 }
 
-// Потокобезопасная очередь директорий — используем mutex + condvar
-class DirQueue {
+class DirQueue { // потокобезопасная очередь директорий
 public:
-    void push(fs::path p) {
-        std::lock_guard<std::mutex> lk(mtx);
+    void push(fs::path p) { // добавление в очередь
+        std::lock_guard<std::mutex> lk(mtx); // блокировка мьютекса
         q.push(std::move(p));
-        cv.notify_one();
+        cv.notify_one(); // пробуждает один поток в ожидании
     }
 
-    // Попытка получить элемент; блокирует если пусто, но вернёт false, если завершение (no more work)
-    bool pop_or_wait(fs::path& out, std::atomic<int>& pending_dirs, std::atomic<bool>& stop_flag) {
+    bool pop_or_wait(fs::path& out, std::atomic<int>& pending_dirs, std::atomic<bool>& stop_flag) { // вытаскивает директорию из очереди или ждёт появления новых
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [&] { return !q.empty() || stop_flag.load() || pending_dirs.load() == 0; });
-        if (!q.empty()) {
-            out = std::move(q.front());
+        cv.wait(lk, [&] { return !q.empty() || stop_flag.load() || pending_dirs.load() == 0; }); // проверка для потока можно ли выходить из сна
+        if (!q.empty()) { 
+            out = std::move(q.front()); // получаем первый элемент из очереди и затем удаляем его
             q.pop();
             return true;
         }
@@ -66,7 +60,7 @@ public:
 private:
     std::queue<fs::path> q;
     std::mutex mtx;
-    std::condition_variable cv;
+    std::condition_variable cv; // поток
 };
 
 int main(int argc, char* argv[]) {
@@ -82,14 +76,14 @@ int main(int argc, char* argv[]) {
 
     fs::path start_path = argv[1];
     std::string pattern = argv[2];
-    int num_threads = (argc >= 4) ? std::max(1, std::stoi(argv[3])) : std::max(1u, std::thread::hardware_concurrency());
+    int num_threads = (argc >= 4) ? std::max(1, std::stoi(argv[3])) : std::max(1u, std::thread::hardware_concurrency()); // если количество потоков не указано - количество аппаратных потоков системы
 
     if (!fs::exists(start_path)) {
         std::cerr << "Ошибка: стартовый путь не существует: " << start_path << "\n";
         return 1;
     }
 
-    // Поддержка: если pattern не содержит '*' или '?', используем подстрочный поиск (опция)
+    // если pattern не содержит '*' или '?', используем обычный подстрочный поиск, без использования wildcardToRegex
     bool use_wildcard = (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos);
     std::regex pattern_regex = use_wildcard ? wildcardToRegex(pattern) : std::regex(".*", std::regex::icase);
 
@@ -98,23 +92,18 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> stop_flag{ false };
     std::mutex print_mtx;
 
-    // Положим стартовую директорию
     dirq.push(start_path);
     pending_dirs.fetch_add(1);
 
-    // Воркер-функция
     auto worker = [&](int id) {
         while (true) {
             fs::path dir;
             bool got = dirq.pop_or_wait(dir, pending_dirs, stop_flag);
             if (!got) {
-                // Проверка: если нет заданий и pending_dirs==0 => завершение
-                if (pending_dirs.load() == 0) break;
-                // Иначе — могло быть пробуждение, пробуем ещё раз
+                if (pending_dirs.load() == 0) break; // если нет заданий и pending_dirs==0 - завершение работы
                 continue;
             }
 
-            // Обрабатываем директорию
             try {
                 for (const auto& entry : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied)) {
                     try {
@@ -130,7 +119,7 @@ int main(int argc, char* argv[]) {
                                 matched = std::regex_match(filename, pattern_regex);
                             }
                             else {
-                                // простое подстрочное, case-insensitive
+                                // нижний регистр
                                 std::string lowername = filename;
                                 std::string lowerpat = pattern;
                                 std::transform(lowername.begin(), lowername.end(), lowername.begin(), ::tolower);
@@ -145,7 +134,7 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     catch (const fs::filesystem_error& e) {
-                        // Проблемы с конкретной записью — логируем и продолжаем
+                        // проблемы с конкретной записью - логируем и продолжаем
                         std::lock_guard<std::mutex> lk(print_mtx);
                         std::cerr << "[warn] " << e.what() << " (path: " << entry.path().string() << ")\n";
                     }
@@ -156,23 +145,23 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[warn] Не удалось открыть директорию " << dir.string() << ": " << e.what() << "\n";
             }
 
-            // Готово с этой директорией
+            // готово с этой директорией
             int remaining = pending_dirs.fetch_sub(1) - 1; // fetch_sub возвращяет старое значение
-            // Если теперь нет директорий — нужно разбудить всех, чтобы воркеры могли выйти
+            // если теперь нет директорий — нужно разбудить всех, чтобы воркеры могли выйти
             if (remaining == 0) {
                 dirq.notify_all();
             }
         }
         };
 
-    // Запускаем пул потоков
+    // запуск пула потоков
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
         threads.emplace_back(worker, i);
     }
 
-    // Ждём завершения
+    // ждём завершения
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
