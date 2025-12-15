@@ -175,7 +175,7 @@ int main(int argc, char* argv[]) {
                             any_file_found.store(true);  // пометка, что что-то нашли
 
                             std::string full_path = entry.path().string();
-                            std::string output = "Time: " + get_current_time() + " ms | Path: " + full_path;
+                            std::string output = "Time: " + get_current_time() + " | Path: " + full_path;
 
                             std::cout << full_path << "\n";
                             log(output);
