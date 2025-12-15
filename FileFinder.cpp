@@ -8,59 +8,104 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
-#include <regex>
 #include <string>
 #include <locale.h> 
+#include <fstream>
+#include <algorithm>
+#include <sstream>
+#include <chrono>
+#include <iomanip>
+#include <ctime>
 
 namespace fs = std::filesystem;
-std::regex wildcardToRegex(const std::string& pattern) { // преобразование шаблона в регулярное выражение
-    std::string regex_s;
-    regex_s.reserve(pattern.size() * 2); // резервация памяти заранее
-    regex_s.push_back('^'); // ^ - начало строки
-    for (char c : pattern) {
-        switch (c) {
-        case '*': regex_s += ".*"; break;
-        case '?': regex_s += "."; break;
-        case '.': regex_s += "\\."; break;
-        case '\\': regex_s += "\\\\"; break;
-        default:
-            if (std::string(".^$+()[]{}|").find(c) != std::string::npos) {
-                regex_s.push_back('\\');
-            }
-            regex_s.push_back(c);
+
+// сопоставление имени файла с шаблоном
+bool matchWildcard(const std::string& name, const std::string& pattern) {
+    size_t n = 0, p = 0;
+    size_t star = std::string::npos, match = 0;
+
+    while (n < name.size()) {
+        if (p < pattern.size() &&
+            (pattern[p] == '?' ||
+                std::tolower(static_cast<unsigned char>(pattern[p])) ==
+                std::tolower(static_cast<unsigned char>(name[n])))) {
+            ++n;
+            ++p;
+        }
+        else if (p < pattern.size() && pattern[p] == '*') {
+            star = p++;
+            match = n;
+        }
+        else if (star != std::string::npos) {
+            p = star + 1;
+            n = ++match;
+        }
+        else {
+            return false;
         }
     }
-    regex_s.push_back('$'); // $ - конец строки
-    return std::regex(regex_s, std::regex::icase);
+
+    while (p < pattern.size() && pattern[p] == '*')
+        ++p;
+
+    return p == pattern.size();
 }
 
-class DirQueue { // потокобезопасная очередь директорий
+std::mutex log_mtx; // мьютекс для лога
+std::ofstream log_file; // лог файл
+std::atomic<bool> any_file_found{ false };  // найден ли хотя бы один файл
+
+std::string get_current_time() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm local_tm;  // структура для локального времени
+    localtime_s(&local_tm, &time_t_now);
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_tm, "%d-%m-%Y %H:%M:%S");
+    oss << '.' << std::setprecision(3) << std::fixed << ms.count();
+    return oss.str();
+}
+
+// точка отсчёта времени — запуск main
+const auto program_start = std::chrono::high_resolution_clock::now();
+
+// логирование
+void log(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(log_mtx);
+    log_file << msg << std::endl;
+}
+
+// потокобезопасная очередь директорий
+class DirQueue { 
 public:
-    void push(fs::path p) { // добавление в очередь
-        std::lock_guard<std::mutex> lk(mtx); // блокировка мьютекса
+    void push(fs::path p) { // добавление директории в очередь
+        std::lock_guard<std::mutex> lk(mtx);
         q.push(std::move(p));
-        cv.notify_one(); // пробуждает один поток в ожидании
+        cv.notify_one();
     }
 
-    bool pop_or_wait(fs::path& out, std::atomic<int>& pending_dirs, std::atomic<bool>& stop_flag) { // вытаскивает директорию из очереди или ждёт появления новых
+    bool pop_or_wait(fs::path& out, std::atomic<int>& pending_dirs, std::atomic<bool>& stop_flag) {
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [&] { return !q.empty() || stop_flag.load() || pending_dirs.load() == 0; }); // проверка для потока можно ли выходить из сна
-        if (!q.empty()) { 
-            out = std::move(q.front()); // получаем первый элемент из очереди и затем удаляем его
+        cv.wait(lk, [&] { return !q.empty() || stop_flag.load() || pending_dirs.load() == 0; });
+        if (!q.empty()) {
+            out = std::move(q.front());
             q.pop();
             return true;
         }
         return false;
     }
 
-    void notify_all() {
+    void notify_all() { // пробуждение всех потоков
         cv.notify_all();
     }
 
 private:
     std::queue<fs::path> q;
     std::mutex mtx;
-    std::condition_variable cv; // поток
+    std::condition_variable cv;
 };
 
 int main(int argc, char* argv[]) {
@@ -76,95 +121,109 @@ int main(int argc, char* argv[]) {
 
     fs::path start_path = argv[1];
     std::string pattern = argv[2];
-    int num_threads = (argc >= 4) ? std::max(1, std::stoi(argv[3])) : std::max(1u, std::thread::hardware_concurrency()); // если количество потоков не указано - количество аппаратных потоков системы
+    int num_threads = (argc >= 4) ? std::max(1, std::stoi(argv[3])) : std::max(1u, std::thread::hardware_concurrency());
 
-    if (!fs::exists(start_path)) {
-        std::cerr << "Ошибка: стартовый путь не существует: " << start_path << "\n";
+    log_file.open("filefinder.log", std::ios::out | std::ios::app);
+    if (!log_file.is_open()) {
+        std::cerr << "Не удалось открыть файл лога filefinder.log\n";
         return 1;
     }
 
-    // если pattern не содержит '*' или '?', используем обычный подстрочный поиск, без использования wildcardToRegex
-    bool use_wildcard = (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos);
-    std::regex pattern_regex = use_wildcard ? wildcardToRegex(pattern) : std::regex(".*", std::regex::icase);
+    log("\n=== FileFinder started at " + get_current_time() + " ===");
+    log("Start path: " + start_path.string());
+    log("Pattern: " + pattern);
+    log("Threads: " + std::to_string(num_threads));
+
+    if (!fs::exists(start_path)) {
+        log("[error] Start path does not exist");
+        std::cerr << "Ошибка: стартовый путь не существует: " << start_path << "\n";
+        log_file.close();
+        return 1;
+    }
 
     DirQueue dirq;
-    std::atomic<int> pending_dirs{ 0 }; // количество директорий, которые либо в очереди, либо обрабатываются
+    std::atomic<int> pending_dirs{ 0 };
     std::atomic<bool> stop_flag{ false };
-    std::mutex print_mtx;
 
     dirq.push(start_path);
-    pending_dirs.fetch_add(1);
+    pending_dirs.fetch_add(1); // стартовую директорию добавляем в очередь
 
     auto worker = [&](int id) {
+        {
+            std::ostringstream oss;
+            oss << "Thread started. ID = " << std::this_thread::get_id();
+            log(oss.str());
+        }
+
         while (true) {
             fs::path dir;
             bool got = dirq.pop_or_wait(dir, pending_dirs, stop_flag);
             if (!got) {
-                if (pending_dirs.load() == 0) break; // если нет заданий и pending_dirs==0 - завершение работы
+                if (pending_dirs.load() == 0) break;
                 continue;
             }
 
             try {
                 for (const auto& entry : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied)) {
-                    try {
-                        if (entry.is_directory()) {
-                            // добавляем новую директорию в очередь
-                            pending_dirs.fetch_add(1);
-                            dirq.push(entry.path());
-                        }
-                        else if (entry.is_regular_file() || entry.is_symlink()) {
-                            std::string filename = entry.path().filename().string();
-                            bool matched = false;
-                            if (use_wildcard) {
-                                matched = std::regex_match(filename, pattern_regex);
-                            }
-                            else {
-                                // нижний регистр
-                                std::string lowername = filename;
-                                std::string lowerpat = pattern;
-                                std::transform(lowername.begin(), lowername.end(), lowername.begin(), ::tolower);
-                                std::transform(lowerpat.begin(), lowerpat.end(), lowerpat.begin(), ::tolower);
-                                matched = (lowername.find(lowerpat) != std::string::npos);
-                            }
-
-                            if (matched) {
-                                std::lock_guard<std::mutex> lk(print_mtx);
-                                std::cout << entry.path().string() << "\n";
-                            }
-                        }
+                    if (entry.is_directory()) {
+                        pending_dirs.fetch_add(1);
+                        dirq.push(entry.path());
                     }
-                    catch (const fs::filesystem_error& e) {
-                        // проблемы с конкретной записью - логируем и продолжаем
-                        std::lock_guard<std::mutex> lk(print_mtx);
-                        std::cerr << "[warn] " << e.what() << " (path: " << entry.path().string() << ")\n";
+                    else if (entry.is_regular_file() || entry.is_symlink()) {
+                        std::string filename = entry.path().filename().string();
+                        if (matchWildcard(filename, pattern)) {
+                            any_file_found.store(true);  // пометка, что что-то нашли
+
+                            std::string full_path = entry.path().string();
+                            std::string output = "Time: " + get_current_time() + " ms | Path: " + full_path;
+
+                            std::cout << full_path << "\n";
+                            log(output);
+                        }
                     }
                 }
             }
             catch (const fs::filesystem_error& e) {
-                std::lock_guard<std::mutex> lk(print_mtx);
-                std::cerr << "[warn] Не удалось открыть директорию " << dir.string() << ": " << e.what() << "\n";
+                log(std::string("[warn] Access denied or error in directory: ") + dir.string() + " - " + e.what());
+            }
+            catch (const std::exception& e) {
+                log(std::string("[error] Unexpected exception in directory: ") + dir.string() + " - " + e.what());
+            }
+            catch (...) {
+                log(std::string("[error] Unknown exception in directory: ") + dir.string());
             }
 
-            // готово с этой директорией
-            int remaining = pending_dirs.fetch_sub(1) - 1; // fetch_sub возвращяет старое значение
-            // если теперь нет директорий — нужно разбудить всех, чтобы воркеры могли выйти
+            int remaining = pending_dirs.fetch_sub(1) - 1; // уменьшаем количество директорий на 1, если закончили с текущей
             if (remaining == 0) {
                 dirq.notify_all();
             }
         }
+        {
+            std::ostringstream oss;
+            oss << "Thread finished. ID = " << std::this_thread::get_id();
+            log(oss.str());
+        }
         };
 
-    // запуск пула потоков
+    // запуск потоков
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
         threads.emplace_back(worker, i);
     }
 
-    // ждём завершения
+    // ожидание завершения
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
+
+    if (!any_file_found.load()) { // если не нашли ни одного файла по шаблону
+        std::cout << "Искомый файл не найден\n";
+        log("[info] No files matched the pattern");
+    }
+
+    log("=== FileFinder finished ===");
+    log_file.close();
 
     return 0;
 }
